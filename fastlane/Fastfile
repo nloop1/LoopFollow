@@ -126,26 +126,109 @@ platform :ios do
       key_content: "#{FASTLANE_KEY}"
     )
 
-    def configure_bundle_id(name, identifier, capabilities)
+    def create_app_group_if_needed(group_identifier)
+      require 'jwt'
+      require 'net/https'
+      require 'json'
+
+      private_key = OpenSSL::PKey::EC.new(FASTLANE_KEY)
+
+      now = Time.now.to_i
+      payload = {
+        iat: now - 60,
+        exp: now + 500,
+        aud: 'appstoreconnect-v1'
+      }
+      payload[:iss] = FASTLANE_ISSUER_ID if FASTLANE_ISSUER_ID
+
+      headers = { kid: FASTLANE_KEY_ID, typ: 'JWT' }
+      jwt_token = JWT.encode(payload, private_key, 'ES256', headers)
+
+      uri = URI('https://api.appstoreconnect.apple.com/v1/appGroups')
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = true
+
+      request = Net::HTTP::Post.new(uri.path)
+      request['Content-Type'] = 'application/json'
+      request['Authorization'] = "Bearer #{jwt_token}"
+
+      body = {
+        data: {
+          type: 'appGroups',
+          attributes: {
+            identifier: group_identifier,
+            name: 'LoopFollow'
+          }
+        }
+      }
+      request.body = body.to_json
+
+      response = http.request(request)
+
+      case response.code.to_i
+      when 200, 201
+        UI.success("Created App Group: #{group_identifier}")
+        return true
+      when 409
+        UI.success("App Group already exists: #{group_identifier}")
+        return true
+      else
+        UI.important("Note: Could not create App Group '#{group_identifier}' (HTTP #{response.code}). If it does not exist, create it manually at https://developer.apple.com/account/resources/identifiers/list/group")
+        UI.verbose("Response: #{response.body}")
+        return false
+      end
+    end
+
+    app_group_id = "group.com.#{TEAMID}.LoopFollow"
+    create_app_group_if_needed(app_group_id)
+
+    def configure_bundle_id(name, identifier, capabilities, app_group_id: nil)
       bundle_id = Spaceship::ConnectAPI::BundleId.find(identifier) || Spaceship::ConnectAPI::BundleId.create(
         name:       name,
         identifier: identifier,
         platform:   "IOS"
       )
-      existing = bundle_id.get_capabilities.map(&:capability_type)
-      capabilities.reject { |c| existing.include?(c) }.each do |cap|
-        bundle_id.create_capability(cap)
+      existing_caps = bundle_id.get_capabilities
+      existing_types = existing_caps.map(&:capability_type)
+
+      if app_group_id
+        existing_caps.each do |cap|
+          if cap.is_type?(Spaceship::ConnectAPI::BundleIdCapability::Type::APP_GROUPS)
+            cap.delete!
+            UI.important("Removed existing APP_GROUPS on #{identifier} to recreate with correct App Group settings")
+            existing_types.delete(Spaceship::ConnectAPI::BundleIdCapability::Type::APP_GROUPS)
+          end
+        end
+      end
+
+      capabilities.each do |cap|
+        next if existing_types.include?(cap)
+
+        settings = []
+        if cap == Spaceship::ConnectAPI::BundleIdCapability::Type::APP_GROUPS && app_group_id
+          settings << {
+            key: "UNIVERSAL_APP_GROUPS",
+            options: [
+              {
+                key: "PRIMARY_APP_GROUP",
+                value: app_group_id
+              }
+            ]
+          }
+        end
+        bundle_id.create_capability(cap, settings: settings)
+        UI.success("Enabled #{cap} on #{identifier}")
       end
     end
 
     configure_bundle_id("LoopFollow", "com.#{TEAMID}.LoopFollow", [
       Spaceship::ConnectAPI::BundleIdCapability::Type::APP_GROUPS,
       Spaceship::ConnectAPI::BundleIdCapability::Type::PUSH_NOTIFICATIONS
-    ])
+    ], app_group_id: "group.com.#{TEAMID}.LoopFollow")
     
     configure_bundle_id("LoopFollow Live Activity Extension", "com.#{TEAMID}.LoopFollow.LoopFollowLAExtension", [
       Spaceship::ConnectAPI::BundleIdCapability::Type::APP_GROUPS
-    ])
+    ], app_group_id: "group.com.#{TEAMID}.LoopFollow")
 
   end
 
